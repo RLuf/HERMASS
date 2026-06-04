@@ -2097,23 +2097,12 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Prefix tool names with mcp_ (Claude Code convention)
-        if anthropic_tools:
-            for tool in anthropic_tools:
-                if "name" in tool:
-                    tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
-
-        # 4. Prefix tool names in message history (tool_use and tool_result blocks)
-        for msg in anthropic_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "tool_use" and "name" in block:
-                            if not block["name"].startswith(_MCP_TOOL_PREFIX):
-                                block["name"] = _MCP_TOOL_PREFIX + block["name"]
-                        elif block.get("type") == "tool_result" and "tool_use_id" in block:
-                            pass  # tool_result uses ID, not name
+        # 3. NOTE: mcp_ prefix injection removed — Anthropic's Max plan
+        # gate treats mcp_-prefixed tools as user-MCP-server tools that
+        # require overage. With overage disabled on Max, every request
+        # was rejected with "out of extra usage". Tools now ship with
+        # their bare names; this matches what the official Claude Code
+        # CLI sends for built-in tools.
 
     kwargs: Dict[str, Any] = {
         "model": model,
