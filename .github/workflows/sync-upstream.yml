@@ -1,0 +1,282 @@
+name: sync-upstream
+
+# Daily sync of branch oauth-max with NousResearch/hermes-agent:main.
+# Strategy: merge upstream INTO oauth-max (not rebase). The patch is one
+# committed change on top of upstream; merge conflicts only happen when
+# upstream touches the same hunks in agent/anthropic_adapter.py.
+#
+# Flow:
+#   1. Fetch upstream and our branch.
+#   2. Attempt clean merge. If clean and smoke test passes -> open PR.
+#   3. If merge has conflicts -> invoke claude CLI to resolve them using
+#      the patch description + the upstream surrounding code, then verify
+#      with the smoke test. If that succeeds -> open PR labeled
+#      auto-resolved. If it fails -> open PR labeled needs-human-review
+#      with conflict markers + reasoning notes attached.
+#
+# The workflow never auto-merges into main of the fork. A human (you)
+# reviews and merges the PR.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'   # 07:17 UTC daily (~04:17 BRT)
+  workflow_dispatch:
+    inputs:
+      force_full_history:
+        description: 'Unshallow before merge (slower, but needed for big upstream backlogs)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REMOTE_URL: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: oauth-max
+  SYNC_BRANCH_PREFIX: auto/sync
+  PATCHED_FILES: agent/anthropic_adapter.py
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sync_branch: ${{ steps.merge.outputs.sync_branch }}
+      status: ${{ steps.merge.outputs.status }}
+      upstream_head: ${{ steps.fetch.outputs.upstream_head }}
+
+    steps:
+      - name: Checkout oauth-max
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "hermes-fork-bot"
+          git config user.email "rlufti+hermes-bot@gmail.com"
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REMOTE_URL"
+          if [ "${{ inputs.force_full_history }}" = "true" ]; then
+            git fetch upstream "$UPSTREAM_BRANCH" --tags
+          else
+            git fetch upstream "$UPSTREAM_BRANCH" --depth=5000
+          fi
+          UPSTREAM_HEAD=$(git rev-parse upstream/$UPSTREAM_BRANCH)
+          echo "upstream_head=$UPSTREAM_HEAD" >> "$GITHUB_OUTPUT"
+          echo "Upstream head: $UPSTREAM_HEAD"
+          BASE=$(git merge-base HEAD upstream/$UPSTREAM_BRANCH || echo "unknown")
+          echo "Merge base: $BASE"
+          BEHIND=$(git rev-list --count "${BASE}..upstream/${UPSTREAM_BRANCH}" 2>/dev/null || echo "?")
+          echo "Behind upstream by: $BEHIND commits"
+
+      - name: Short-circuit when already in sync
+        id: gate
+        run: |
+          if git merge-base --is-ancestor upstream/$UPSTREAM_BRANCH HEAD; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do — upstream/$UPSTREAM_BRANCH is an ancestor of HEAD."
+          else
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt merge
+        id: merge
+        if: steps.gate.outputs.already_synced != 'true'
+        run: |
+          SYNC_BRANCH="${SYNC_BRANCH_PREFIX}/$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -b "$SYNC_BRANCH"
+          echo "sync_branch=$SYNC_BRANCH" >> "$GITHUB_OUTPUT"
+
+          set +e
+          git merge --no-ff --no-commit upstream/$UPSTREAM_BRANCH
+          MERGE_EXIT=$?
+          set -e
+
+          if [ $MERGE_EXIT -eq 0 ]; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+            git commit -m "chore(sync): merge upstream/${UPSTREAM_BRANCH} into ${FORK_BRANCH}"
+          else
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::Merge produced conflicts. Will attempt AI resolution next."
+            git diff --name-only --diff-filter=U > .conflicts.txt
+            echo "Conflicted files:"
+            cat .conflicts.txt
+          fi
+
+      - name: Run smoke test (clean merge path)
+        id: smoke_clean
+        if: steps.merge.outputs.status == 'clean'
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/test_oauth_max_patch.py -v
+          echo "smoke=pass" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # AI conflict resolution path
+      # -----------------------------------------------------------------
+      - name: Install Claude CLI
+        if: steps.merge.outputs.status == 'conflict'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Resolve conflicts with Claude
+        id: ai_resolve
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -e
+          PROMPT_FILE=$(mktemp)
+          cat > "$PROMPT_FILE" <<'PROMPT'
+          You are resolving git merge conflicts in a fork of NousResearch/hermes-agent.
+
+          CONTEXT: This fork carries one local patch (see commit 69ac2b2ca and
+          upstream issue #28849): the `mcp_` tool-name prefix loop inside
+          `build_anthropic_kwargs` (file `agent/anthropic_adapter.py`) MUST stay
+          removed on the OAuth path. The official upstream rejects this fix on
+          policy grounds — do not undo it. Concretely:
+
+            * If upstream re-added the loop that prefixes tool names with
+              "mcp_" inside the `if is_oauth:` branch, keep it OUT.
+            * Preserve the explanatory comment block starting with
+              "NOTE: mcp_ prefix injection removed".
+            * If upstream renamed `is_oauth` or the function, find the
+              equivalent path and apply the same removal there.
+
+          INSTRUCTIONS:
+          1. Read every conflicted file listed in .conflicts.txt.
+          2. Produce a final, clean version of each file (no <<<<<<< markers).
+          3. Apply the conflict resolution rule above on agent/anthropic_adapter.py.
+          4. For other files, prefer upstream's version unless it directly
+             contradicts the rule above.
+          5. After editing, run: python -m pytest tests/test_oauth_max_patch.py -v
+             and ensure all four tests pass.
+          6. When done, exit. Do NOT commit — the workflow will commit for you.
+
+          Be precise. If you cannot confidently resolve a file, leave the
+          conflict markers in place — a human will review.
+          PROMPT
+
+          claude --print --permission-mode acceptEdits \
+                 --output-format text \
+                 "$(cat "$PROMPT_FILE")" > .claude_resolution.log 2>&1 || true
+
+          tail -100 .claude_resolution.log || true
+
+          # Check if any conflict markers remain.
+          if grep -rlE '^(<<<<<<<|=======|>>>>>>>) ' --include='*' . 2>/dev/null \
+                | grep -v '^\./.git/' | grep -v '^\./.claude_resolution.log$' > .remaining_conflicts.txt; then
+            if [ -s .remaining_conflicts.txt ]; then
+              echo "ai_resolved=partial" >> "$GITHUB_OUTPUT"
+              echo "::warning::Claude could not resolve all conflicts. Remaining:"
+              cat .remaining_conflicts.txt
+            else
+              echo "ai_resolved=full" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "ai_resolved=full" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test after AI resolution
+        id: smoke_ai
+        if: steps.merge.outputs.status == 'conflict' && steps.ai_resolve.outputs.ai_resolved == 'full'
+        continue-on-error: true
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/test_oauth_max_patch.py -v
+          echo "smoke=pass" >> "$GITHUB_OUTPUT"
+
+      - name: Commit AI resolution
+        id: commit_ai
+        if: steps.merge.outputs.status == 'conflict' && steps.ai_resolve.outputs.ai_resolved == 'full'
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing was actually changed by Claude."
+            exit 1
+          fi
+          MSG="chore(sync): merge upstream/${UPSTREAM_BRANCH} into ${FORK_BRANCH} (AI-resolved)"
+          if [ "${{ steps.smoke_ai.outputs.smoke }}" = "pass" ]; then
+            git commit -m "$MSG"
+          else
+            git commit -m "$MSG (smoke test FAILED — needs review)"
+          fi
+
+      # -----------------------------------------------------------------
+      # PR creation (covers both clean and AI-resolved paths)
+      # -----------------------------------------------------------------
+      - name: Push sync branch
+        id: push
+        if: steps.merge.outputs.status == 'clean' || steps.commit_ai.conclusion == 'success'
+        run: |
+          git push origin "${{ steps.merge.outputs.sync_branch }}"
+
+      - name: Open PR
+        if: steps.push.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATUS="${{ steps.merge.outputs.status }}"
+          SMOKE_CLEAN="${{ steps.smoke_clean.outputs.smoke }}"
+          SMOKE_AI="${{ steps.smoke_ai.outputs.smoke }}"
+          AI_STATUS="${{ steps.ai_resolve.outputs.ai_resolved }}"
+
+          if [ "$STATUS" = "clean" ]; then
+            LABEL="auto-clean"
+            TITLE="sync: upstream/${UPSTREAM_BRANCH} → ${FORK_BRANCH} (clean merge)"
+          else
+            if [ "$SMOKE_AI" = "pass" ]; then
+              LABEL="auto-resolved"
+              TITLE="sync: upstream/${UPSTREAM_BRANCH} → ${FORK_BRANCH} (AI-resolved)"
+            else
+              LABEL="needs-human-review"
+              TITLE="sync: upstream/${UPSTREAM_BRANCH} → ${FORK_BRANCH} (needs review)"
+            fi
+          fi
+
+          BODY=$(cat <<EOF
+          Automated daily sync of upstream NousResearch/hermes-agent:main into oauth-max.
+
+          - merge status: $STATUS
+          - smoke clean: $SMOKE_CLEAN
+          - smoke after AI: $SMOKE_AI
+          - AI resolution: $AI_STATUS
+          - upstream HEAD: ${{ steps.fetch.outputs.upstream_head }}
+
+          Smoke test: tests/test_oauth_max_patch.py — guards the patch for issue NousResearch/hermes-agent#28849.
+          Files touched by the local patch: $PATCHED_FILES.
+
+          Reminder: the local patch must NEVER be reverted by an upstream merge.
+          See commit 69ac2b2ca for the original change.
+          EOF
+          )
+
+          # Try to apply label; create it if it doesn't exist yet.
+          if ! gh label list --limit 100 | grep -q "^$LABEL"; then
+            gh label create "$LABEL" --color BFD4F2 --description "Created by sync-upstream workflow" || true
+          fi
+
+          gh pr create \
+            --base "$FORK_BRANCH" \
+            --head "${{ steps.merge.outputs.sync_branch }}" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "$LABEL"
+
+      - name: Cleanup branch on no-op
+        if: steps.gate.outputs.already_synced == 'true'
+        run: echo "Already in sync — nothing pushed."
