@@ -1,0 +1,8 @@
+All four test conditions pass:
+
+1. **`test_mcp_prefix_loop_is_absent`** — the forbidden `tool["name"] = _MCP_TOOL_PREFIX + ...` and `block["name"] = _MCP_TOOL_PREFIX + ...` patterns are absent.
+2. **`test_explanatory_sentinel_comment_present`** — `"mcp_ prefix injection removed"` is present (1 occurrence).
+3. **`test_oauth_branch_still_exists`** — `if is_oauth:` is present.
+4. **`test_build_anthropic_kwargs_signature_unchanged`** — `def build_anthropic_kwargs(` is present.
+
+The conflict in `agent/anthropic_adapter.py` is cleanly resolved: the upstream's `mcp_` prefix injection loop (which re-introduced the Max plan overage bug) was discarded, and the fork's explanatory comment block was preserved in its place. No other files were conflicted.
