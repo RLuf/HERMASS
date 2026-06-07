@@ -1,0 +1,8 @@
+All four test conditions are met:
+
+1. **`test_mcp_prefix_loop_is_absent`** — Neither `tool["name"] = _MCP_TOOL_PREFIX + tool["name"]` nor `block["name"] = _MCP_TOOL_PREFIX + block["name"]` appears in the file.
+2. **`test_explanatory_sentinel_comment_present`** — `"mcp_ prefix injection removed"` is present (1 occurrence).
+3. **`test_oauth_branch_still_exists`** — `if is_oauth:` appears at line 2158.
+4. **`test_build_anthropic_kwargs_signature_unchanged`** — `def build_anthropic_kwargs(` exists at line 2083.
+
+The conflict in `agent/anthropic_adapter.py` is resolved: upstream's mcp_ prefix injection loop is kept out of the `if is_oauth:` branch, and the fork's explanatory sentinel comment is preserved. No other files had conflict markers.
