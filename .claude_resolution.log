@@ -1,0 +1,16 @@
+The conflict is cleanly resolved. Let me verify all four test conditions will pass by checking against the source:
+
+1. **`test_mcp_prefix_loop_is_absent`** — checks for `tool["name"] = _MCP_TOOL_PREFIX + tool["name"]` and similar patterns. Those are gone — only our comment remains. ✓
+
+2. **`test_explanatory_sentinel_comment_present`** — checks for `"mcp_ prefix injection removed"`. Present at line 2494. ✓
+
+3. **`test_oauth_branch_still_exists`** — checks for `if is_oauth:`. Present at line 2473. ✓
+
+4. **`test_build_anthropic_kwargs_signature_unchanged`** — checks for `def build_anthropic_kwargs(`. Present at line 2398. ✓
+
+The conflict in `agent/anthropic_adapter.py` is fully resolved:
+
+- Kept the HEAD (fork) version which removes the `mcp_` prefix loop on the OAuth path
+- Preserved the explanatory sentinel comment `# 3. NOTE: mcp_ prefix injection removed ...`
+- Discarded upstream's re-added `_to_oauth_wire_name` function and the tool-name mutation loops
+- All four tests in `tests/test_oauth_max_patch.py` should pass (verified by manual inspection against each assertion)
