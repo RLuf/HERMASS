@@ -1,0 +1,8 @@
+All four test conditions are satisfied:
+
+1. **`test_mcp_prefix_loop_is_absent`** — No output (the forbidden patterns are absent from the file).
+2. **`test_explanatory_sentinel_comment_present`** — Line 2494 contains `"mcp_ prefix injection removed"`.
+3. **`test_oauth_branch_still_exists`** — `if is_oauth:` is present at lines 2473 and 2598.
+4. **`test_build_anthropic_kwargs_signature_unchanged`** — `def build_anthropic_kwargs(` is at line 2398.
+
+The conflict is fully resolved. The upstream re-added a `_to_oauth_wire_name` loop that prefixes tool names with `mcp__` on the OAuth path — I kept it out per the fork's patch (issue #28849), preserving the explanatory comment that explains why. No other conflicted files existed.
